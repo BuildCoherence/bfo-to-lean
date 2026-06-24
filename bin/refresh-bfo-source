@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Re-vendor the upstream BFO source at the given commit SHA into
+# vendor/bfo-source/. The only path that mutates the vendored tree;
+# hand-edits are caught by bin/verify-bfo-source.
+#
+# Usage: bin/refresh-bfo-source <sha>
+#
+# The new tree is built in a sibling staging directory and swapped
+# atomically. An interrupt before the swap leaves vendor/bfo-source/
+# untouched; an interrupt mid-swap restores the previous tree from the
+# aside location.
+
+set -euo pipefail
+
+if [ "$#" -ne 1 ]; then
+  echo "usage: $0 <sha>" >&2
+  exit 2
+fi
+
+sha="$1"
+if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "expected a 40-character lowercase hex commit SHA; got: $sha" >&2
+  exit 2
+fi
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+subtree_root="$(cd "$script_dir/.." && pwd)"
+vendor_dir="$subtree_root/vendor/bfo-source"
+vendor_parent="$(dirname "$vendor_dir")"
+
+# shellcheck source=./_vendor-config.sh
+. "$script_dir/_vendor-config.sh"
+
+# stage_dir is a sibling of vendor_dir so the final mv is an atomic
+# rename on the same filesystem.
+clone_tmp="$(mktemp -d)"
+stage_dir="$(mktemp -d "$vendor_parent/bfo-source.stage.XXXXXX")"
+aside_dir=""
+
+cleanup() {
+  local rc=$?
+  # Restore the original tree if the swap was interrupted mid-way.
+  if [ -n "$aside_dir" ] && [ -d "$aside_dir" ] && [ ! -d "$vendor_dir" ]; then
+    mv "$aside_dir" "$vendor_dir" || true
+  fi
+  rm -rf "$clone_tmp" "$stage_dir"
+  if [ -n "$aside_dir" ] && [ -d "$aside_dir" ]; then
+    rm -rf "$aside_dir"
+  fi
+  exit $rc
+}
+trap cleanup EXIT
+
+echo "Fetching $VENDOR_UPSTREAM_REPO at $sha ..." >&2
+git -C "$clone_tmp" init -q
+git -C "$clone_tmp" remote add origin "$VENDOR_UPSTREAM_REPO"
+git -C "$clone_tmp" fetch --depth=1 origin "$sha" >/dev/null
+git -C "$clone_tmp" checkout -q FETCH_HEAD
+
+# The vendored tree mirrors upstream's path layout exactly, so a
+# `diff -r` against a fresh upstream clone needs no path rewriting.
+src_cl="$clone_tmp/21838-2/common-logic"
+if [ ! -d "$src_cl" ]; then
+  echo "upstream tree at $sha has no 21838-2/common-logic/ directory" >&2
+  exit 1
+fi
+
+# Build the new vendor tree in the staging directory.
+mkdir -p "$stage_dir/21838-2/common-logic"
+cp -R "$src_cl"/. "$stage_dir/21838-2/common-logic/"
+for sub in "${VENDOR_EXCLUDED_SUBDIRS[@]}"; do
+  rm -rf "$stage_dir/21838-2/common-logic/$sub"
+done
+
+if [ -f "$clone_tmp/README.md" ]; then
+  cp "$clone_tmp/README.md" "$stage_dir/README.md"
+fi
+
+# Upstream BFO ships no separate LICENSE file; the license statement
+# lives in the README. We preserve the existing vendored LICENSE text
+# across refresh when upstream still ships none.
+if [ -f "$clone_tmp/LICENSE" ]; then
+  cp "$clone_tmp/LICENSE" "$stage_dir/LICENSE"
+elif [ -f "$vendor_dir/LICENSE" ]; then
+  cp "$vendor_dir/LICENSE" "$stage_dir/LICENSE"
+fi
+
+retrieved_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+cat > "$stage_dir/.provenance.json" <<EOF
+{
+  "repo": "$VENDOR_UPSTREAM_REPO",
+  "commit_sha": "$sha",
+  "retrieved_at": "$retrieved_at"
+}
+EOF
+
+# Both directories live on the same filesystem (siblings under
+# vendor_parent), so the two `mv` calls are atomic renames. A SIGINT
+# between them is recovered by the cleanup trap.
+if [ -d "$vendor_dir" ]; then
+  aside_dir="$(mktemp -d "$vendor_parent/bfo-source.old.XXXXXX")"
+  rmdir "$aside_dir"  # mktemp creates it; we need the name free for mv
+  mv "$vendor_dir" "$aside_dir"
+fi
+mv "$stage_dir" "$vendor_dir"
+# Clear stage_dir so the cleanup trap doesn't try to rm -rf an
+# already-moved directory.
+stage_dir=""
+
+echo "Vendored BFO source at $sha into $vendor_dir" >&2
+echo "Next: re-run 'lake exe convert' to regenerate bfo.lean" >&2

@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Re-fetch the upstream BFO source at the commit SHA recorded in
+# vendor/bfo-source/.provenance.json and assert byte-equality with
+# vendor/bfo-source/'s 21838-2/common-logic/*.cl files. Catches a
+# hand-edit to a vendored .cl file, a forged provenance record, or a
+# buggy refresh script.
+#
+# CI runs this on every PR whose diff touches .provenance.json or
+# either of the refresh / verify scripts; routine PRs skip it to keep
+# the network out of normal CI.
+
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+subtree_root="$(cd "$script_dir/.." && pwd)"
+vendor_dir="$subtree_root/vendor/bfo-source"
+prov="$vendor_dir/.provenance.json"
+
+# shellcheck source=./_vendor-config.sh
+. "$script_dir/_vendor-config.sh"
+
+if [ ! -f "$prov" ]; then
+  echo "missing $prov" >&2
+  exit 1
+fi
+
+sha="$("$script_dir/read-provenance-field" commit_sha "$prov")"
+repo_url="$("$script_dir/read-provenance-field" repo "$prov")"
+
+if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+  echo ".provenance.json commit_sha is not a 40-char lowercase hex SHA: $sha" >&2
+  exit 1
+fi
+
+# Refuse to fetch if the recorded URL has drifted from the hard-coded
+# upstream — otherwise an attacker who swaps both the .cl bytes and the
+# `repo` field passes the audit against their own mirror.
+if [ "$repo_url" != "$VENDOR_UPSTREAM_REPO" ]; then
+  echo "AUDIT FAIL: .provenance.json repo URL ($repo_url) does not match the hard-coded upstream ($VENDOR_UPSTREAM_REPO)." >&2
+  echo "  The audit refuses to fetch from a non-canonical URL." >&2
+  exit 1
+fi
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+echo "Re-fetching $VENDOR_UPSTREAM_REPO at $sha for vendor audit ..." >&2
+git -C "$tmp" init -q
+git -C "$tmp" remote add origin "$VENDOR_UPSTREAM_REPO"
+if ! git -C "$tmp" fetch --depth=1 origin "$sha" >/dev/null 2>&1; then
+  echo "AUDIT FAIL: upstream $VENDOR_UPSTREAM_REPO no longer resolves $sha." >&2
+  echo "  This is either an upstream force-push or repo deletion." >&2
+  echo "  The vendored bytes remain authoritative; the audit cannot confirm them." >&2
+  exit 1
+fi
+git -C "$tmp" checkout -q FETCH_HEAD
+
+upstream_cl="$tmp/21838-2/common-logic"
+vendored_cl="$vendor_dir/21838-2/common-logic"
+
+if [ ! -d "$upstream_cl" ]; then
+  echo "AUDIT FAIL: upstream at $sha has no 21838-2/common-logic/ directory" >&2
+  exit 1
+fi
+
+# Byte-equality on every file under common-logic, excluding upstream
+# subdirectories the converter does not vendor (see _vendor-config.sh).
+# Includes the *.cl modules, README, and release-notes — anything under
+# this path that upstream ships at the pinned SHA must match what we
+# vendored.
+exclude_args=()
+for sub in "${VENDOR_EXCLUDED_SUBDIRS[@]}"; do
+  exclude_args+=("--exclude=$sub")
+done
+
+if ! diff -r "${exclude_args[@]}" "$upstream_cl" "$vendored_cl" >/dev/null; then
+  echo "AUDIT FAIL: vendored CLIF tree differs from upstream at $sha" >&2
+  diff -r "${exclude_args[@]}" "$upstream_cl" "$vendored_cl" >&2 || true
+  exit 1
+fi
+
+echo "Vendor audit OK: vendor/bfo-source/21838-2/common-logic == $VENDOR_UPSTREAM_REPO@$sha" >&2

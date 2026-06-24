@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Read a single top-level string field from vendor/bfo-source/.provenance.json.
+#
+# Usage: bin/read-provenance-field <key> [<provenance-file>]
+#
+# The provenance file's shape is fixed (we own its writer in
+# bin/refresh-bfo-source); a simple sed extraction is sufficient and keeps
+# this helper dependency-free (no jq) on CI runners. Both bin/verify-bfo-source
+# and the Lean converter (BfoToLean.Provenance) read fields through this
+# helper so the extraction logic lives in exactly one place.
+#
+# Exits non-zero (and emits the reason on stderr) if the file is missing,
+# if no value is found, or if the extracted value is empty.
+
+set -euo pipefail
+
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+  echo "usage: $0 <key> [<provenance-file>]" >&2
+  exit 2
+fi
+
+key="$1"
+
+if [ "$#" -eq 2 ]; then
+  prov="$2"
+else
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  subtree_root="$(cd "$script_dir/.." && pwd)"
+  prov="$subtree_root/vendor/bfo-source/.provenance.json"
+fi
+
+if [ ! -f "$prov" ]; then
+  echo "missing $prov" >&2
+  exit 1
+fi
+
+value="$(sed -n "s/.*\"$key\": *\"\\([^\"]*\\)\".*/\\1/p" "$prov" | head -1)"
+
+if [ -z "$value" ]; then
+  echo "$prov: missing or empty field '$key'" >&2
+  exit 1
+fi
+
+printf '%s\n' "$value"

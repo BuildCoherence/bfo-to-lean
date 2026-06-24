@@ -1,0 +1,33 @@
+name = "BfoToLean"
+version = "1.0.0"
+defaultTargets = ["BfoToLean", "convert", "BfoToLeanTests"]
+testDriver = "convert"
+testDriverArgs = ["--check"]
+
+[[lean_lib]]
+name = "BfoToLean"
+
+[[lean_exe]]
+name = "convert"
+root = "Main"
+supportInterpreter = true
+
+# The generated deliverable. Declared as a `lean_lib` so the Tests
+# library can `import BFO` and exercise its elaboration (which is the
+# type-check fidelity test) and BFO theorems over it.
+[[lean_lib]]
+name = "BFO"
+srcDir = "."
+roots = ["BFO"]
+
+# Test library — `lake build BfoToLeanTests` elaborates `Theorems.lean`,
+# forcing elaboration of `BFO.lean` under the pinned toolchain and
+# type-checking the BFO theorems against the generated bundle. `lake test`
+# runs `lake exe convert --check` for determinism + completeness; this
+# library covers the third CI fidelity check (BFO theorems + BFO.lean
+# elaboration).
+[[lean_lib]]
+name = "BfoToLeanTests"
+srcDir = "."
+roots = ["Theorems"]
+

@@ -1,0 +1,72 @@
+name: bfo-to-lean CI
+
+# Elaborates the generated `BFO.lean` plus the BFO-theorems test
+# library. On PRs that touch `vendor/bfo-source/.provenance.json` (or
+# the `bin/refresh-bfo-source` / `bin/verify-bfo-source` scripts
+# themselves), the vendor audit runs `bin/verify-bfo-source` to
+# re-fetch BFO upstream at the recorded SHA and assert byte-equality
+# against `vendor/`.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  fidelity:
+    # The fidelity checks are split across two explicit Lake invocations
+    # so a failure surfaces in the GitHub Actions UI as the labeled step
+    # that broke (not buried inside lean-action's combined stdout):
+    #
+    #   - `lake build` elaborates `BFO.lean` and the BfoToLeanTests
+    #     library (default targets) — type-check + BFO theorems.
+    #   - `lake test` runs the `convert --check` test driver —
+    #     determinism + completeness.
+    #
+    # `leanprover/lean-action@v1` with `build: false, test: false` is
+    # used only to install the toolchain pinned by `lean-toolchain`;
+    # the two Lake invocations are explicit `run:` steps below.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Lean toolchain
+        uses: leanprover/lean-action@v1
+        with:
+          build: false
+          test: false
+      - name: Build converter and BFO theorems
+        run: lake build
+      - name: Run determinism + completeness check
+        run: lake test
+
+  vendor-audit:
+    runs-on: ubuntu-latest
+    # Only fires on PRs whose diff touches the provenance record or
+    # the audit scripts themselves. On other PRs the audit is skipped,
+    # keeping the network out of routine CI.
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect provenance / script touches
+        id: detect
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          paths=$(git diff --name-only "$base...$head" -- \
+            'vendor/bfo-source/.provenance.json' \
+            'bin/refresh-bfo-source' \
+            'bin/verify-bfo-source')
+          if [ -n "$paths" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Vendor audit will run; changed paths:"
+            printf '  %s\n' $paths
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Provenance/scripts untouched; skipping vendor audit."
+          fi
+      - name: Run vendor audit
+        if: steps.detect.outputs.run == 'true'
+        run: ./bin/verify-bfo-source
